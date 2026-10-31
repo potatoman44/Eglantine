@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <optional>
 #include "common/common_funcs.h"
@@ -54,6 +55,14 @@ public:
 
     void ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value);
 
+    /// Records that a backing range may hold data (it was freed after use), so the next zero
+    /// clear of it has to write. Pages never marked are still zero from the host and are not
+    /// touched, which keeps them from taking host memory.
+    void MarkBackingDirty(size_t physical_offset, size_t length);
+
+    /// Starts a new emulation session: every page used before counts as dirty again.
+    void ResetBackingTracking();
+
     [[nodiscard]] u8* BackingBasePointer() noexcept {
         return backing_base;
     }
@@ -77,6 +86,10 @@ public:
     }
 
 private:
+    std::unique_ptr<std::atomic<u64>[]> dirty_pages;
+    size_t dirty_words{};
+    bool backing_used{};
+
     size_t backing_size{};
     size_t virtual_size{};
 

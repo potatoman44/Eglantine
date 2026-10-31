@@ -10,6 +10,10 @@
 #include <tuple>
 
 #include "common/common_funcs.h"
+
+namespace Common {
+class HostMemory;
+}
 #include "core/hle/kernel/k_light_lock.h"
 #include "core/hle/kernel/k_memory_layout.h"
 #include "core/hle/kernel/k_page_heap.h"
@@ -211,8 +215,12 @@ private:
         KPhysicalAddress AllocateAligned(s32 index, size_t num_pages, size_t align_pages) {
             return m_heap.AllocateAligned(index, num_pages, align_pages);
         }
-        void Free(KPhysicalAddress addr, size_t num_pages) {
-            m_heap.Free(addr, num_pages);
+        void Free(KPhysicalAddress addr, size_t num_pages);
+
+        // Freed pages are tracked as dirty in the host backing memory (see
+        // Common::HostMemory::MarkBackingDirty) once the initial heap is built.
+        void SetBacking(Common::HostMemory* backing) {
+            m_backing = backing;
         }
 
         void SetInitialUsedHeapSize(size_t reserved_size) {
@@ -325,6 +333,7 @@ private:
         using RefCount = u16;
 
         KPageHeap m_heap;
+        Common::HostMemory* m_backing{};
         std::vector<RefCount> m_page_reference_counts;
         KVirtualAddress m_management_region{};
         Pool m_pool{};

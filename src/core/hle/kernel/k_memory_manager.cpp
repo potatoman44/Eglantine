@@ -169,6 +169,21 @@ void KMemoryManager::Initialize(KVirtualAddress management_region, size_t manage
     for (size_t i = 0; i < m_num_managers; ++i) {
         m_managers[i].SetInitialUsedHeapSize(reserved_sizes[i]);
     }
+
+    // From here on, freed pages may hold data: track them so zero clears skip untouched memory.
+    auto& backing = m_system.DeviceMemory().buffer;
+    backing.ResetBackingTracking();
+    for (size_t i = 0; i < m_num_managers; ++i) {
+        m_managers[i].SetBacking(std::addressof(backing));
+    }
+}
+
+void KMemoryManager::Impl::Free(KPhysicalAddress addr, size_t num_pages) {
+    if (m_backing != nullptr) {
+        m_backing->MarkBackingDirty(GetInteger(addr) - Core::DramMemoryMap::Base,
+                                    num_pages * PageSize);
+    }
+    m_heap.Free(addr, num_pages);
 }
 
 Result KMemoryManager::InitializeOptimizedMemory(u64 process_id, Pool pool) {

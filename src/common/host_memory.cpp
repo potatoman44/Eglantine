@@ -51,11 +51,13 @@
 
 #endif // ^^^ POSIX ^^^
 
+#include <algorithm>
 #include <mutex>
 #include <random>
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/div_ceil.h"
 #include "common/free_region_manager.h"
 #include "common/host_memory.h"
 #include "common/logging.h"
@@ -731,6 +733,10 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
         impl.reset();
     }
 #endif
+    if (backing_base != nullptr) {
+        dirty_words = Common::DivCeil(Common::DivCeil(backing_size, PageAlignment), size_t{64});
+        dirty_pages = std::make_unique<std::atomic<u64>[]>(dirty_words);
+    }
 }
 
 HostMemory::~HostMemory() {
@@ -791,7 +797,56 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 }
 
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
-    std::memset(backing_base + physical_offset, fill_value, length);
+    // Backing memory starts out zero. Writing zeros over pages nobody has used yet makes the host
+    // commit them (a Switch 2 title's heap is several GiB, nearly all of it cleared at launch), so
+    // only pages freed since their last use are written.
+    if (fill_value != 0 || !dirty_pages || physical_offset % PageAlignment != 0 ||
+        length % PageAlignment != 0) {
+        std::memset(backing_base + physical_offset, fill_value, length);
+        return;
+    }
+    backing_used = true;
+    const size_t first = physical_offset / PageAlignment;
+    const size_t end = first + length / PageAlignment;
+    size_t run = end;
+    for (size_t page = first; page < end; ++page) {
+        const bool dirty =
+            ((dirty_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1) != 0;
+        if (dirty && run == end) {
+            run = page;
+        } else if (!dirty && run != end) {
+            std::memset(backing_base + run * PageAlignment, 0, (page - run) * PageAlignment);
+            run = end;
+        }
+    }
+    if (run != end) {
+        std::memset(backing_base + run * PageAlignment, 0, (end - run) * PageAlignment);
+    }
+}
+
+void HostMemory::MarkBackingDirty(size_t physical_offset, size_t length) {
+    if (!dirty_pages || length == 0) {
+        return;
+    }
+    const size_t first = physical_offset / PageAlignment;
+    const size_t end = (std::min)(Common::DivCeil(physical_offset + length, PageAlignment),
+                                  dirty_words * 64);
+    for (size_t page = first; page < end;) {
+        const size_t bit = page % 64;
+        const size_t count = (std::min)(size_t{64} - bit, end - page);
+        const u64 mask = count == 64 ? ~u64{0} : ((u64{1} << count) - 1) << bit;
+        dirty_pages[page / 64].fetch_or(mask, std::memory_order_relaxed);
+        page += count;
+    }
+}
+
+void HostMemory::ResetBackingTracking() {
+    if (!dirty_pages || !backing_used) {
+        return;
+    }
+    for (size_t i = 0; i < dirty_words; ++i) {
+        dirty_pages[i].store(~u64{0}, std::memory_order_relaxed);
+    }
 }
 
 void HostMemory::EnableDirectMappedAddress() {
