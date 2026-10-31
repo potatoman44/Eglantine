@@ -52,6 +52,7 @@
 #endif // ^^^ POSIX ^^^
 
 #include <algorithm>
+#include <cstdlib>
 #include <mutex>
 #include <vector>
 #include <random>
@@ -147,8 +148,14 @@ public:
             return false;
         }
 
-        // Allocate backing file map
-        backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, SEC_COMMIT, backing_size, nullptr, nullptr, 0);
+        // Allocate backing file map. With SEC_COMMIT the whole backing (20 GiB on the Switch 2
+        // layout) counts against the system commit limit up front, although a game touches a
+        // fraction of it: on a 15 GB laptop that left too little commit for the graphics driver
+        // and allocations failed mid-race. Lazy mode reserves the section and commits 64 KiB
+        // chunks on first access (CommitForFault). EDEN_LAZY_COMMIT=0/1 forces it off/on; by
+        // default it is on below 32 GiB of RAM.
+        lazy_commit = UseLazyCommit();
+        backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, lazy_commit ? SEC_RESERVE : SEC_COMMIT, backing_size, nullptr, nullptr, 0);
         if (!backing_handle) {
             LOG_CRITICAL(HW_Memory, "Failed to allocate {} MiB of backing memory", backing_size >> 20);
             return false;
@@ -174,6 +181,79 @@ public:
             LOG_CRITICAL(HW_Memory, "Failed to reserve {} GiB of virtual memory", virtual_size >> 30);
             return false;
         }
+        if (lazy_commit) {
+            committed_chunks = std::make_unique<std::atomic<u64>[]>(
+                Common::DivCeil(Common::DivCeil(backing_size, CommitChunk), size_t{64}));
+            static const PVOID handler = AddVectoredExceptionHandler(1, &LazyCommitHandler);
+            (void)handler;
+            lazy_impl.store(this, std::memory_order_release);
+            LOG_INFO(HW_Memory, "Backing memory: {} MiB reserved, committed as it is used",
+                     backing_size >> 20);
+        }
+        return true;
+    }
+
+    static bool UseLazyCommit() {
+        if (const char* value = std::getenv("EDEN_LAZY_COMMIT")) {
+            return value[0] != '0';
+        }
+        MEMORYSTATUSEX status{};
+        status.dwLength = sizeof(status);
+        return GlobalMemoryStatusEx(&status) && status.ullTotalPhys < (u64{32} << 30);
+    }
+
+    static LONG CALLBACK LazyCommitHandler(EXCEPTION_POINTERS* info) {
+        const EXCEPTION_RECORD& record = *info->ExceptionRecord;
+        if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        Impl* const impl = lazy_impl.load(std::memory_order_acquire);
+        if (impl == nullptr ||
+            !impl->CommitForFault(reinterpret_cast<u8*>(record.ExceptionInformation[1]))) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    /// Commits the chunk behind a faulting address in the backing or the fastmem view. False when
+    /// the address is elsewhere or already committed (a real access violation, e.g. a protected
+    /// page), so other handlers see it.
+    bool CommitForFault(u8* address) {
+        size_t offset{};
+        if (address >= backing_base && address < backing_base + backing_size) {
+            offset = static_cast<size_t>(address - backing_base);
+        } else if (virtual_base != nullptr && address >= virtual_base &&
+                   address < virtual_base + virtual_size) {
+            const size_t virtual_offset = static_cast<size_t>(address - virtual_base);
+            std::scoped_lock lock{placeholder_mutex};
+            const auto it = placeholders.find({virtual_offset, virtual_offset + 1});
+            if (it == placeholders.end()) {
+                return false;
+            }
+            const auto host = placeholder_host_pointers.find(it->lower());
+            if (host == placeholder_host_pointers.end()) {
+                return false;
+            }
+            offset = host->second + (virtual_offset - it->lower());
+        } else {
+            return false;
+        }
+        const size_t chunk = offset / CommitChunk;
+        const u64 bit = u64{1} << (chunk % 64);
+        auto& word = committed_chunks[chunk / 64];
+        if ((word.load(std::memory_order_acquire) & bit) != 0) {
+            return false;
+        }
+        std::scoped_lock lock{commit_mutex};
+        if ((word.load(std::memory_order_acquire) & bit) != 0) {
+            return true; // another thread committed it meanwhile
+        }
+        const size_t begin = chunk * CommitChunk;
+        const size_t size = (std::min)(CommitChunk, backing_size - begin);
+        if (VirtualAlloc(backing_base + begin, size, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+            return false;
+        }
+        word.fetch_or(bit, std::memory_order_release);
         return true;
     }
 
@@ -248,6 +328,9 @@ public:
 private:
     /// Release all resources in the object
     void Release() {
+        if (lazy_impl.load(std::memory_order_acquire) == this) {
+            lazy_impl.store(nullptr, std::memory_order_release);
+        }
         if (!placeholders.empty()) {
             for (const auto& placeholder : placeholders) {
                 if (!pfn_UnmapViewOfFile2(process, virtual_base + placeholder.lower(),
@@ -402,6 +485,12 @@ private:
     std::mutex placeholder_mutex;                                 ///< Mutex for placeholders
     boost::icl::separate_interval_set<size_t> placeholders;       ///< Mapped placeholders
     ::Common::unordered_map<size_t, size_t> placeholder_host_pointers; ///< Placeholder backing offset
+
+    static constexpr size_t CommitChunk = 0x10000;
+    static inline std::atomic<Impl*> lazy_impl{};
+    bool lazy_commit{};
+    std::mutex commit_mutex;
+    std::unique_ptr<std::atomic<u64>[]> committed_chunks; ///< One bit per CommitChunk
 };
 
 #elif defined(__OPENORBIS__) || defined(__managarm__)
