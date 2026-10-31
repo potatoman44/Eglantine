@@ -2067,12 +2067,30 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                UsesSparseLayers(runtime_.device, info, gpu_addr_) ||
                                    IsUnwrittenSparse(info, gpu_addr_))),
       aspect_mask(ImageAspectMask(info.format)) {
+    bool has_sparse_layers = false;
+    if (original_image.IsUnbacked() && UsesSparseLayers(runtime_.device, info, gpu_addr_)) {
+        has_sparse_layers = InitSparseLayers();
+        if (!has_sparse_layers && !IsUnwrittenSparse(info, gpu_addr_)) {
+            // The driver can't describe this image's sparse tiles (AMD reports a zero granularity
+            // for some formats): back it with ordinary memory instead.
+            LOG_WARNING(Render_Vulkan, "Image {:#x}: no usable sparse layout, backing it fully",
+                        gpu_addr_);
+            original_image = MakeImage(runtime_.device, runtime_.memory_allocator,
+                                       TrimmedHostInfo(runtime_.device, info, host_level_offset),
+                                       IsHugeAstcArray(runtime_.device, info)
+                                           ? std::span<const VkFormat>{HugeAstcViewFormats}
+                                       : IsOpaqueBc1Astc(runtime_.device, info)
+                                           ? std::span<const VkFormat>{OpaqueAstcViewFormats}
+                                           : runtime->ViewFormats(info.format),
+                                       AstcHostFormat(runtime_.device, info), false);
+        }
+    }
     if (original_image.IsUnbacked()) {
         flags |= VideoCommon::ImageFlagBits::Unbacked;
         const ImageInfo host_info = TrimmedHostInfo(runtime_.device, info, host_level_offset);
         const u64 texels = u64{host_info.size.width} * host_info.size.height *
                            host_info.size.depth * static_cast<u64>(host_info.resources.layers);
-        if (UsesSparseLayers(runtime_.device, info, gpu_addr_) && InitSparseLayers()) {
+        if (has_sparse_layers) {
             flags |= VideoCommon::ImageFlagBits::SparseLayers;
         } else if (texels <= (u64{1} << 28)) {
             // Not too big to back (see MemoryAllocator::CreateImage): unbacked because nothing
@@ -2560,9 +2578,17 @@ bool Image::InitSparseLayers() {
     if (it == requirements.end()) {
         return false;
     }
+    const VkExtent3D granularity = it->formatProperties.imageGranularity;
+    const auto memory_requirements = device.GetLogical().GetImageMemoryRequirements(handle);
+    if (granularity.width == 0 || granularity.height == 0 || memory_requirements.alignment == 0) {
+        LOG_WARNING(Render_Vulkan, "Sparse layered image {:#x}: driver reports granularity {}x{}, "
+                    "alignment {}; not using sparse layers", gpu_addr, granularity.width,
+                    granularity.height, memory_requirements.alignment);
+        return false;
+    }
     SparseLayerMemory& s = sparse_layers;
     s.allocator = &runtime->memory_allocator;
-    s.requirements = device.GetLogical().GetImageMemoryRequirements(handle);
+    s.requirements = memory_requirements;
     s.sparse = *it;
     u32 offset = host_level_offset;
     const ImageInfo host = TrimmedHostInfo(device, info, offset);
@@ -2574,7 +2600,6 @@ bool Image::InitSparseLayers() {
     const u32 block_width = huge_astc ? 1 : VideoCore::Surface::DefaultBlockWidth(info.format);
     const u32 block_height = huge_astc ? 1 : VideoCore::Surface::DefaultBlockHeight(info.format);
     const u64 block_bytes = huge_astc ? 4 : VideoCore::Surface::BytesPerBlock(info.format);
-    const VkExtent3D granularity = it->formatProperties.imageGranularity;
     s.tile_width = granularity.width;
     s.tile_height = granularity.height;
     const u64 tile = s.requirements.alignment;
