@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <limits>
 #include <array>
 #include <bitset>
 #include <chrono>
@@ -1678,7 +1679,20 @@ u64 Device::GetDeviceMemoryBudget() const {
             result += budget.heapUsage[heap] - (std::min)(budget.heapUsage[heap], unused);
         }
     }
-    return result;
+    if (valid_heap_memory.size() <= 1) {
+        return result;
+    }
+    // Integrated GPUs spread images over several heaps with budgets of their own (a Radeon 610M:
+    // 2.5 GB device local, 5.1 GB system). Their sum hides one heap running out while another has
+    // room: the caches waited for 6.9 GB in total while the system heap was past its 5.1 GB, and
+    // allocations failed. Report the budget as current use plus the smallest heap's headroom.
+    s64 headroom = (std::numeric_limits<s64>::max)();
+    for (const size_t heap : valid_heap_memory) {
+        headroom = (std::min)(headroom, static_cast<s64>(budget.heapBudget[heap]) -
+                                            static_cast<s64>(budget.heapUsage[heap]));
+    }
+    const s64 tightest = static_cast<s64>(GetDeviceMemoryUsage()) + headroom;
+    return (std::min)(result, static_cast<u64>((std::max)(tightest, s64{0})));
 }
 
 void Device::CollectPhysicalMemoryInfo() {
