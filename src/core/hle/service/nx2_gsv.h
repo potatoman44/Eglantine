@@ -1085,8 +1085,16 @@ private:
         auto& syncpoints = system.Host1x().GetSyncpointManager();
         const auto start = std::chrono::steady_clock::now();
         // Long enough to cover shader/pipeline compile stalls: a game that gets more than a few
-        // command buffers ahead misses the equal-value gates its other channels acquire.
-        const auto deadline = start + std::chrono::milliseconds{4000};
+        // command buffers ahead misses the equal-value gates its other channels acquire. On slow
+        // hosts the GPU can fall far more than 4 s behind (texture decodes, paging); released
+        // early, the game reuses command memory the GPU has not read yet and the GPU then runs
+        // garbage. EDEN_NX2_PRESENT_TIMEOUT_MS overrides it.
+        static const auto timeout = [] {
+            const char* value = std::getenv("EDEN_NX2_PRESENT_TIMEOUT_MS");
+            const unsigned long long ms = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+            return std::chrono::milliseconds{ms != 0 ? ms : 30000};
+        }();
+        const auto deadline = start + timeout;
         if (!syncpoints.IsReadyGuest(fence_id, fence_value)) {
             // Woken by the GPU thread as it reaches the fence. Polling with 200 us sleeps slept
             // about 1 ms per check on Windows, added to every frame. An action left registered
@@ -1111,8 +1119,8 @@ private:
             }
         }
         if (!syncpoints.IsReadyGuest(fence_id, fence_value) && m_wait_timeouts++ < 64) {
-            LOG_WARNING(Service, "nx2:vi2 present #{} fence ({}, {}) not reached in 4 s (now {})",
-                        m_presents, fence_id, fence_value, syncpoints.GetGuestSyncpointValue(fence_id));
+            LOG_WARNING(Service, "nx2:vi2 present #{} fence ({}, {}) not reached in {} ms (now {})",
+                        m_presents, fence_id, fence_value, timeout.count(), syncpoints.GetGuestSyncpointValue(fence_id));
         }
         if (m_presents <= 8 || (m_presents % 600) == 0) {
             LOG_INFO(Service, "nx2:vi2 present #{} fence ({}, {}) now {}, waited {} us",
