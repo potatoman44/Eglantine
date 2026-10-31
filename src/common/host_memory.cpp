@@ -239,22 +239,50 @@ public:
             return false;
         }
         const size_t chunk = offset / CommitChunk;
-        const u64 bit = u64{1} << (chunk % 64);
-        auto& word = committed_chunks[chunk / 64];
-        if ((word.load(std::memory_order_acquire) & bit) != 0) {
-            return false;
+        if (IsCommitted(chunk)) {
+            // Another thread may have committed it between this fault and now: retry the access
+            // once. A second fault at the same address is a real one (e.g. a protected page).
+            thread_local u8* retried{};
+            if (retried == address) {
+                retried = nullptr;
+                return false;
+            }
+            retried = address;
+            return true;
         }
+        return CommitChunkLocked(chunk);
+    }
+
+    bool IsCommitted(size_t chunk) const {
+        return (committed_chunks[chunk / 64].load(std::memory_order_acquire) &
+                (u64{1} << (chunk % 64))) != 0;
+    }
+
+    bool CommitChunkLocked(size_t chunk) {
         std::scoped_lock lock{commit_mutex};
-        if ((word.load(std::memory_order_acquire) & bit) != 0) {
-            return true; // another thread committed it meanwhile
+        if (IsCommitted(chunk)) {
+            return true;
         }
         const size_t begin = chunk * CommitChunk;
         const size_t size = (std::min)(CommitChunk, backing_size - begin);
         if (VirtualAlloc(backing_base + begin, size, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
             return false;
         }
-        word.fetch_or(bit, std::memory_order_release);
+        committed_chunks[chunk / 64].fetch_or(u64{1} << (chunk % 64), std::memory_order_release);
         return true;
+    }
+
+    void CommitRange(size_t offset, size_t length) {
+        if (!lazy_commit || length == 0) {
+            return;
+        }
+        const size_t end = (std::min)(Common::DivCeil(offset + length, CommitChunk),
+                                      Common::DivCeil(backing_size, CommitChunk));
+        for (size_t chunk = offset / CommitChunk; chunk < end; ++chunk) {
+            if (!IsCommitted(chunk)) {
+                CommitChunkLocked(chunk);
+            }
+        }
     }
 
     ~Impl() {
@@ -306,6 +334,13 @@ public:
         while (it != end) {
             const size_t offset = (std::max)(it->lower(), virtual_offset);
             const size_t protect_length = (std::min)(it->upper(), virtual_end) - offset;
+            if (lazy_commit) {
+                // VirtualProtect fails on pages of the section nobody committed yet.
+                const auto host = placeholder_host_pointers.find(it->lower());
+                if (host != placeholder_host_pointers.end()) {
+                    CommitRange(host->second + (offset - it->lower()), protect_length);
+                }
+            }
             DWORD old_flags{};
             if (!VirtualProtect(virtual_base + offset, protect_length, new_flags, &old_flags)) {
                 LOG_CRITICAL(HW_Memory, "Failed to change virtual memory protect rules");
