@@ -269,7 +269,13 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     if (forced != 0) {
         return forced;
     }
-    return device.GetDeviceLocalMemory() < (u64{7} << 30) ? (u64{256} << 20) : (u64{512} << 20);
+    // Integrated GPUs sharing system RAM (under 6 GiB, e.g. a Radeon 610M): title 1's three
+    // terrain arrays at 256 MiB still ran race loads out of memory on a 16 GB laptop.
+    const u64 local = device.GetDeviceLocalMemory();
+    if (local < (u64{6} << 30)) {
+        return u64{128} << 20;
+    }
+    return local < (u64{7} << 30) ? (u64{256} << 20) : (u64{512} << 20);
 }
 
 // The host shape of an image whose decoded copy would not fit in VRAM: a GPU-decoded ASTC array
