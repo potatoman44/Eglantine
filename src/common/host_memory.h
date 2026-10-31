@@ -66,6 +66,10 @@ public:
     /// A new kernel on this memory: everything a previous one used may hold data.
     void ForgetContents();
 
+    /// Bytes of a backing range the host currently keeps in RAM, if the platform can tell.
+    [[nodiscard]] std::optional<size_t> ResidentBackingBytes(size_t physical_offset,
+                                                             size_t length) const;
+
     [[nodiscard]] u8* BackingBasePointer() noexcept {
         return backing_base;
     }

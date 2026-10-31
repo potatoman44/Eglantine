@@ -52,6 +52,7 @@
 #endif // ^^^ POSIX ^^^
 
 #include <mutex>
+#include <vector>
 #include <random>
 
 #include "common/alignment.h"
@@ -850,6 +851,60 @@ void HostMemory::ForgetContents() {
             granules[index].fetch_or(GranuleDirty, std::memory_order_release);
         }
     }
+}
+
+std::optional<size_t> HostMemory::ResidentBackingBytes(size_t physical_offset,
+                                                      size_t length) const {
+    if (backing_base == nullptr || length == 0) {
+        return std::nullopt;
+    }
+    const size_t first = physical_offset / PageAlignment;
+    const size_t end = Common::DivCeil(physical_offset + length, PageAlignment);
+    constexpr size_t Batch = 4096;
+    size_t resident = 0;
+#if defined(_WIN32)
+    using QueryFn = BOOL(WINAPI*)(HANDLE, PVOID, DWORD);
+    static const auto query = reinterpret_cast<QueryFn>(
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32QueryWorkingSetEx"));
+    if (query == nullptr) {
+        return std::nullopt;
+    }
+    struct Entry {
+        PVOID address;
+        ULONG_PTR attributes; ///< Bit 0: the page is in the working set
+    };
+    std::vector<Entry> entries(Batch);
+    for (size_t page = first; page < end; page += Batch) {
+        const size_t count = (std::min)(Batch, end - page);
+        for (size_t i = 0; i < count; ++i) {
+            entries[i] = {backing_base + (page + i) * PageAlignment, 0};
+        }
+        if (!query(GetCurrentProcess(), entries.data(), static_cast<DWORD>(count * sizeof(Entry)))) {
+            return std::nullopt;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            resident += (entries[i].attributes & 1) * PageAlignment;
+        }
+    }
+#elif defined(__OPENORBIS__) || defined(__managarm__)
+    return std::nullopt;
+#else
+#if defined(__APPLE__)
+    std::vector<char> vec(Batch);
+#else
+    std::vector<unsigned char> vec(Batch);
+#endif
+    for (size_t page = first; page < end; page += Batch) {
+        const size_t count = (std::min)(Batch, end - page);
+        if (mincore(backing_base + page * PageAlignment, count * PageAlignment, vec.data()) != 0) {
+            return std::nullopt;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            resident += (vec[i] & 1) * PageAlignment;
+        }
+    }
+#endif
+    return resident;
 }
 
 void HostMemory::EnableDirectMappedAddress() {

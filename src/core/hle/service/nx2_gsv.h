@@ -322,6 +322,25 @@ public:
             Tegra::Nx2SetSparseBacking(
                 [this](u64 gpu_address, u64 size) { BackSparseWrite(gpu_address, size); });
         }
+        // EDEN_NX2_RESIDENT_STATS=<seconds> (default 30, 0 off): how much of the guest's memory
+        // and of the GPU-only regions the host keeps in RAM, as seen through the backing view
+        // (what the GPU side and the kernel touch; guest CPU accesses go through fastmem).
+        static const u32 stats_seconds = [] {
+            const char* value = std::getenv("EDEN_NX2_RESIDENT_STATS");
+            return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 30U;
+        }();
+        if (stats_seconds != 0) {
+            m_stats_thread = std::jthread([this](std::stop_token stop) {
+                Common::SetCurrentThreadName("nx2:ResidentStats");
+                std::mutex mutex;
+                std::condition_variable_any cv;
+                std::unique_lock lk{mutex};
+                while (!cv.wait_for(lk, stop, std::chrono::seconds{stats_seconds},
+                                    [] { return false; })) {
+                    LogResidentStats();
+                }
+            });
+        }
     }
 
     ~INx2GpuSession() override {
@@ -624,6 +643,35 @@ private:
         rb.Push(ResultSuccess);
     }
 
+    void LogResidentStats() {
+        auto& backing = system.DeviceMemory().buffer;
+        std::vector<std::pair<u64, u64>> blocks;
+        u64 region_bytes = 0;
+        {
+            std::scoped_lock lk{m_region_mutex};
+            for (const auto& [gpu_address, region] : m_gpu_only_regions) {
+                region_bytes += region.size;
+                for (const auto& block : *region.pages) {
+                    blocks.emplace_back(GetInteger(block.GetAddress()) - Core::DramMemoryMap::Base,
+                                        block.GetSize());
+                }
+            }
+        }
+        u64 region_resident = 0;
+        for (const auto& [offset, size] : blocks) {
+            const auto resident = backing.ResidentBackingBytes(offset, size);
+            if (!resident) {
+                return;
+            }
+            region_resident += *resident;
+        }
+        const auto total = backing.ResidentBackingBytes(0, backing.BackingSize());
+        LOG_INFO(Service, "nx2 host RAM (backing view): guest memory {} MiB resident of {} MiB; "
+                          "GPU-only regions {} MiB resident of {} MiB in {} blocks",
+                 total.value_or(0) >> 20, backing.BackingSize() >> 20, region_resident >> 20,
+                 region_bytes >> 20, blocks.size());
+    }
+
     // Returns the pages of destroyed regions the GPU thread is done with to the kernel.
     void FreeReleasedRegions() {
         auto* const process = system.ApplicationProcess();
@@ -802,6 +850,7 @@ private:
     std::map<u32, GpuMemory> m_memory;
     u32 m_next_memory_handle{1};
     u32 m_next_device{1};
+    std::jthread m_stats_thread; ///< Last: stopped before the members it reads go away
 };
 
 // Native memory and images handed out by the Switch 2 graphics server (gsv 111/114/423/429/315),
