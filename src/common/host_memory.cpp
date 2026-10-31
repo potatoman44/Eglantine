@@ -272,16 +272,27 @@ public:
         return true;
     }
 
-    void CommitRange(size_t offset, size_t length) {
-        if (!lazy_commit || length == 0) {
-            return;
-        }
-        const size_t end = (std::min)(Common::DivCeil(offset + length, CommitChunk),
-                                      Common::DivCeil(backing_size, CommitChunk));
-        for (size_t chunk = offset / CommitChunk; chunk < end; ++chunk) {
-            if (!IsCommitted(chunk)) {
-                CommitChunkLocked(chunk);
+    /// VirtualProtect over [virtual_offset, +length), backed from host_offset, in runs of
+    /// committed chunks.
+    void ProtectCommitted(size_t virtual_offset, size_t host_offset, size_t length, DWORD flags) {
+        const size_t chunks = Common::DivCeil(backing_size, CommitChunk);
+        const auto committed = [&](size_t chunk) { return chunk < chunks && IsCommitted(chunk); };
+        size_t done = 0;
+        while (done < length) {
+            const bool state = committed((host_offset + done) / CommitChunk);
+            size_t run = done;
+            do {
+                const size_t chunk = (host_offset + run) / CommitChunk;
+                run = (std::min)(length, (chunk + 1) * CommitChunk - host_offset);
+            } while (run < length && committed((host_offset + run) / CommitChunk) == state);
+            if (state) {
+                DWORD old_flags{};
+                if (!VirtualProtect(virtual_base + virtual_offset + done, run - done, flags,
+                                    &old_flags)) {
+                    LOG_CRITICAL(HW_Memory, "Failed to change virtual memory protect rules");
+                }
             }
+            done = run;
         }
     }
 
@@ -334,12 +345,16 @@ public:
         while (it != end) {
             const size_t offset = (std::max)(it->lower(), virtual_offset);
             const size_t protect_length = (std::min)(it->upper(), virtual_end) - offset;
-            if (lazy_commit) {
-                // VirtualProtect fails on pages of the section nobody committed yet.
-                const auto host = placeholder_host_pointers.find(it->lower());
-                if (host != placeholder_host_pointers.end()) {
-                    CommitRange(host->second + (offset - it->lower()), protect_length);
-                }
+            const auto host = placeholder_host_pointers.find(it->lower());
+            if (lazy_commit && host != placeholder_host_pointers.end()) {
+                // VirtualProtect fails on section pages nobody committed yet, and committing
+                // them here would commit whole heaps (the kernel protects them as it maps them).
+                // Protect only committed chunks: an uncommitted one is read-write once its first
+                // access commits it.
+                ProtectCommitted(offset, host->second + (offset - it->lower()), protect_length,
+                                 new_flags);
+                ++it;
+                continue;
             }
             DWORD old_flags{};
             if (!VirtualProtect(virtual_base + offset, protect_length, new_flags, &old_flags)) {
