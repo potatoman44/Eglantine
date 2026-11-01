@@ -24,6 +24,7 @@
 #include "core/cpu_manager.h"
 #include "core/debugger/debugger.h"
 #include "core/device_memory.h"
+#include "core/memory_guard.h"
 #include "core/file_sys/fs_filesystem.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/program_metadata.h"
@@ -435,10 +436,12 @@ struct System::Impl {
             game_info.version = title_version;
             room_member->SendGameInfo(game_info);
         }
+        memory_guard.emplace(system);
         return SystemResultStatus::Success;
     }
 
     void ShutdownMainProcess() {
+        memory_guard.reset();
         SetShuttingDown(true);
         Common::ADPF::Shutdown();
 
@@ -533,6 +536,7 @@ struct System::Impl {
     std::optional<Core::PerfStats> perf_stats;
     std::optional<Tegra::Host1x::Host1x> host1x_core;
     std::optional<Core::DeviceMemory> device_memory;
+    std::optional<Core::MemoryGuard> memory_guard;
     std::optional<AudioCore::AudioCore> audio_core;
     std::optional<Memory::CheatEngine> cheat_engine;
     std::optional<Tools::Freezer> memory_freezer;
