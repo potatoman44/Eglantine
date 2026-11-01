@@ -23,6 +23,7 @@
 #endif
 
 #include "main_window.h"
+#include "yuzu_cmd/nx2_sampler.h"
 
 #ifdef _WIN32
 #include <QScreen>
@@ -97,6 +98,9 @@ int main(int argc, char* argv[]) {
     if (CheckEnvVars(&is_child)) {
         return 0;
     }
+
+    // EDEN_NX2_SAMPLE: the same sampling profiler as eden-cli (yuzu_cmd/nx2_sampler.h).
+    Nx2Sampler::StartFromEnvironment();
 
     if (StartupChecks(argv[0], &has_broken_vulkan,
                       Settings::values.perform_vulkan_check.GetValue())) {

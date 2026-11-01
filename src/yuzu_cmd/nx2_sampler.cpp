@@ -272,8 +272,7 @@ void Report(const std::vector<Target>& targets, const std::vector<Sample>& sampl
     }
 }
 
-void Run(std::vector<std::string> patterns, double start, double seconds, std::string out) {
-    std::this_thread::sleep_for(std::chrono::duration<double>(start));
+void RunOnce(const std::vector<std::string>& patterns, double seconds, const std::string& out) {
     const std::vector<Target> targets = FindThreads(patterns);
     std::fprintf(stderr, "nx2 sampler: %zu threads match, sampling %.0f s\n", targets.size(),
                  seconds);
@@ -305,6 +304,19 @@ void Run(std::vector<std::string> patterns, double start, double seconds, std::s
     std::fprintf(stderr, "nx2 sampler: %zu samples written to %s\n", samples.size(), out.c_str());
     for (const auto& target : targets) {
         CloseHandle(target.handle);
+    }
+}
+
+// EDEN_NX2_SAMPLE_ROUNDS (default 1): sample again every EDEN_NX2_SAMPLE_EVERY seconds (default
+// 60), each round to <out>.<n>.txt, so one run catches a race whenever it starts.
+void Run(std::vector<std::string> patterns, double start, double seconds, std::string out) {
+    const int rounds = (std::max)(1, static_cast<int>(EnvSeconds("EDEN_NX2_SAMPLE_ROUNDS", 1.0)));
+    const double every = (std::max)(seconds, EnvSeconds("EDEN_NX2_SAMPLE_EVERY", 60.0));
+    std::this_thread::sleep_for(std::chrono::duration<double>(start));
+    for (int round = 0; round < rounds; ++round) {
+        const auto begin = std::chrono::steady_clock::now();
+        RunOnce(patterns, seconds, rounds == 1 ? out : out + "." + std::to_string(round) + ".txt");
+        std::this_thread::sleep_until(begin + std::chrono::duration<double>(every));
     }
 }
 
