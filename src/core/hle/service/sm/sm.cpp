@@ -23,7 +23,6 @@
 #include "core/hle/service/cmif_types.h"
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
-#include "core/hle/service/nx2_streamplay.h"
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/server_manager.h"
 #include "core/hle/service/sm/sm.h"
@@ -195,12 +194,8 @@ Kernel::KClientSession* CreateStubSession(Core::System& system, HLERequestContex
 
     auto manager =
         std::make_shared<SessionRequestManager>(kernel, ctx.GetManager()->GetServerManager());
-    if (name == "stpl:u") {
-        manager->SetSessionHandler(std::make_shared<INx2StreamPlayService>(system));
-    } else {
-        manager->SetSessionHandler(std::make_shared<INx2StubInterface>(
-            system, INx2StubInterface::InternName(fmt::format("{}{}", Nx2StubPrefix, name))));
-    }
+    manager->SetSessionHandler(std::make_shared<INx2StubInterface>(
+        system, INx2StubInterface::InternName(fmt::format("{}{}", Nx2StubPrefix, name))));
     ctx.GetManager()->GetServerManager().RegisterSession(&session->GetServerSession(), manager);
     return &session->GetClientSession();
 }

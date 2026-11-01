@@ -1036,7 +1036,6 @@ add_library(core STATIC
     hle/service/server_manager.h
     hle/service/service.cpp
     hle/service/service.h
-    hle/service/nx2_streamplay.h
     hle/service/nx2_stub_interface.h
     hle/service/nx2_gsv.h
     hle/service/services.cpp
@@ -1254,6 +1253,17 @@ if (HAS_NCE)
         arm/nce/patcher.h
         arm/nce/visitor_base.h)
     target_link_libraries(core PRIVATE merry::oaknut)
+endif()
+
+# Native execution of application code on Apple silicon (EDEN_NX2_HYPERVISOR=1).
+if (APPLE AND ARCHITECTURE_arm64)
+    target_sources(core PRIVATE
+        arm/hypervisor/arm_hypervisor.cpp
+        arm/hypervisor/arm_hypervisor.h
+        arm/hypervisor/hv_vm.cpp
+        arm/hypervisor/hv_vm.h)
+    target_compile_definitions(core PRIVATE HAS_HYPERVISOR)
+    target_link_libraries(core PRIVATE "-framework Hypervisor")
 endif()
 
 if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITECTURE_loongarch64)

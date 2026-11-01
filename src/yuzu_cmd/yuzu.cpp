@@ -4,7 +4,6 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
 #include <atomic>
 #include <iterator>
 #include <fstream>
@@ -57,12 +56,11 @@
 #include "yuzu_cmd/emu_window/emu_window_sdl3_vk.h"
 #include "yuzu_cmd/nx2_sampler.h"
 
-#if defined(__unix__) || defined(__APPLE__)
-#include <sys/resource.h>
-#endif
-
 #ifdef _WIN32
 // windows.h needs to be included before shellapi.h
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <shellapi.h>
 #include "common/windows/timer_resolution.h"
@@ -267,12 +265,6 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // Raise the CRT's open-file limit like the Qt frontend: loose RomFS folders keep thousands of
     // files open through the VFS cache.
     _setmaxstdio(8192);
-#elif defined(__unix__) || defined(__APPLE__)
-    // Same for the open file limit (macOS shells default to 256).
-    if (struct rlimit rl; getrlimit(RLIMIT_NOFILE, &rl) == 0) {
-        rl.rlim_cur = std::min<rlim_t>(8192, rl.rlim_max);
-        setrlimit(RLIMIT_NOFILE, &rl);
-    }
 #endif
 
     Common::Log::Initialize();

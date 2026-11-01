@@ -85,10 +85,6 @@
 #include <QStatusBar>
 #include <QtConcurrentRun>
 
-#ifdef __APPLE__
-#include "util/macos_sleep.h"
-#endif
-
 // Qt Common //
 #include "qt_common/config/shared_translation.h"
 #include "qt_common/config/uisettings.h"
@@ -450,7 +446,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     QtCommon::SetupContentProviders();
 
     // Gen keys if necessary
-    OnCheckFirmwareDecryption();
+    OnCheckFirmwareDecryption(false);
 
 #ifdef __unix__
     OnCheckGraphicsBackend();
@@ -497,8 +493,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         VkDeviceInfo::PopulateRecords(vk_device_records, this->window()->windowHandle());
     }
 
-    // On macOS, SDL video would pump AppKit events alongside Qt and disrupt native menus.
-#if !defined(_WIN32) && !defined(__APPLE__)
+#if !defined(_WIN32)
     SDL_InitSubSystem(SDL_INIT_VIDEO);
 
     // Set a screensaver inhibition reason string. Currently passed to DBus by SDL and visible to
@@ -554,10 +549,6 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 }
 
 MainWindow::~MainWindow() {
-#ifdef __APPLE__
-    AllowOSSleep();
-#endif
-
     // will get automatically deleted otherwise
     if (render_window->parent() == nullptr) {
         delete render_window;
@@ -1767,10 +1758,6 @@ void MainWindow::OnSigInterruptNotifierActivated() {
 void MainWindow::PreventOSSleep() {
 #ifdef _WIN32
     SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
-#elif defined(__APPLE__)
-    if (sleep_assertion_id == 0) {
-        sleep_assertion_id = MacOS::PreventSleep();
-    }
 #else
     SDL_DisableScreenSaver();
 #endif
@@ -1779,11 +1766,6 @@ void MainWindow::PreventOSSleep() {
 void MainWindow::AllowOSSleep() {
 #ifdef _WIN32
     SetThreadExecutionState(ES_CONTINUOUS);
-#elif defined(__APPLE__)
-    if (sleep_assertion_id != 0) {
-        MacOS::AllowSleep(sleep_assertion_id);
-        sleep_assertion_id = 0;
-    }
 #else
     SDL_EnableScreenSaver();
 #endif
@@ -4141,9 +4123,7 @@ void MainWindow::OnApplicationChanged(u64 program_id) {
 void MainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view title_version,
                                    std::string_view gpu_vendor) {
     static const std::string build_id = std::string{Common::g_build_id};
-    static const std::string yuzu_title =
-        fmt::format("{} | {} | {}", std::string{Common::g_build_name},
-                    std::string{Common::g_build_version}, std::string{Common::g_compiler_id});
+    static const std::string yuzu_title = "Eglantine - PokeDinner fork by Franseven";
 
     const auto override_title =
         fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);
@@ -4392,8 +4372,13 @@ void MainWindow::OnMouseActivity() {
     }
 }
 
-void MainWindow::OnCheckFirmwareDecryption() {
-    if (!ContentManager::AreKeysPresent()) {
+void MainWindow::OnCheckFirmwareDecryption(bool prompt) {
+    if (!ContentManager::AreKeysPresent() && !prompt) {
+        // At startup only log it: loose ExeFS/RomFS dumps (all Switch 2 games so far) need no
+        // keys, and a modal question blocked every unattended launch. Tools > Install Decryption
+        // Keys still installs them.
+        LOG_WARNING(Frontend, "Decryption keys are missing: NCA, NSP and XCI games need them");
+    } else if (!ContentManager::AreKeysPresent()) {
         const auto res = QtCommon::Frontend::Warning(
             tr("Derivation Components Missing"),
             tr("Decryption keys are missing. Install them now?"),

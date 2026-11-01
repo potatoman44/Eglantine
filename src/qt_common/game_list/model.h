@@ -78,7 +78,6 @@ private:
     void AddFavorite(u64 program_id);
     void RemoveFavorite(u64 program_id);
     void Repopulate();
-    void StopWorker();
 
     bool m_flat = false;
 

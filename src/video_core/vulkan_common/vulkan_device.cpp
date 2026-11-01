@@ -8,6 +8,7 @@
 #include <array>
 #include <bitset>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -463,6 +464,16 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         driver_id == VK_DRIVER_ID_AMD_PROPRIETARY || driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE;
     const bool is_amd = is_amd_driver || is_radv;
 
+    // AMD's proprietary Windows driver can crash while compiling some pipelines concurrently.
+#ifdef _WIN32
+    has_broken_parallel_compiling = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY;
+#else
+    has_broken_parallel_compiling = false;
+#endif
+    if (has_broken_parallel_compiling) {
+        LOG_WARNING(Render_Vulkan, "AMD proprietary driver: serializing pipeline compilation");
+    }
+
     const bool is_intel_windows = driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
     const bool is_intel_anv = driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
 
@@ -473,6 +484,10 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     if (!is_suitable)
         LOG_WARNING(Render_Vulkan, "Unsuitable driver - continuing anyways");
+
+    // Preserve the hardware-generation result before driver workarounds disable fp16.
+    const bool is_amd_gcn4_or_earlier =
+        is_amd && !features.shader_float16_int8.shaderFloat16;
 
     if (is_nvidia) {
         nvidia_arch = GetNvidiaArchitecture(physical, supported_extensions);
@@ -614,7 +629,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         sets_per_pool = 96;
 
         // Disable VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT on AMD GCN4 and lower as it is broken.
-        if (!features.shader_float16_int8.shaderFloat16) {
+        if (is_amd_gcn4_or_earlier) {
             LOG_WARNING(Render_Vulkan,
                         "AMD GCN4 and earlier have broken VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT");
             has_broken_cube_compatibility = true;
@@ -630,7 +645,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     if (extensions.sampler_filter_minmax && is_amd) {
         // Disable ext_sampler_filter_minmax on AMD GCN4 and lower as it is broken.
-        if (!features.shader_float16_int8.shaderFloat16) {
+        if (is_amd_gcn4_or_earlier) {
             LOG_WARNING(Render_Vulkan,
                         "AMD GCN4 and earlier have broken VK_EXT_sampler_filter_minmax");
             RemoveExtension(extensions.sampler_filter_minmax,
@@ -749,6 +764,17 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (extensions.buffer_device_address) {
         flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
     }
+    // EDEN_NX2_VRAM_LIMIT_MIB: VMA fails allocations past the limit, like a smaller card.
+    std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> heap_size_limits;
+    heap_size_limits.fill(VK_WHOLE_SIZE);
+    if (heap_size_limit != 0) {
+        const auto memory_properties = physical.GetMemoryProperties().memoryProperties;
+        for (u32 heap = 0; heap < memory_properties.memoryHeapCount; ++heap) {
+            if (memory_properties.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+                heap_size_limits[heap] = heap_size_limit;
+            }
+        }
+    }
     const VmaAllocatorCreateInfo allocator_info{
             .flags = flags,
             .physicalDevice = physical,
@@ -759,7 +785,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             .preferredLargeHeapBlockSize = 64u * 1024u * 1024u,
             .pAllocationCallbacks = nullptr,
             .pDeviceMemoryCallbacks = nullptr,
-            .pHeapSizeLimit = nullptr,
+            .pHeapSizeLimit = heap_size_limit != 0 ? heap_size_limits.data() : nullptr,
             .pVulkanFunctions = &functions,
             .instance = instance,
             .vulkanApiVersion = ApiVersion(),
@@ -1634,9 +1660,23 @@ u64 Device::GetDeviceMemoryBudget() const {
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
     budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
     physical.GetMemoryProperties(&budget);
-    u64 result{};
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
+    if (allocator != nullptr) {
+        vmaGetHeapBudgets(allocator, heap_budgets.data());
+    }
+    // Only the main heap's budget: summing every heap's counted VRAM twice on AMD (an 8 GB card
+    // reported 8.5 GB) and kept the collector's thresholds above the heap the images fill. What
+    // the other heaps use is added, as GetDeviceMemoryUsage() counts it too.
+    u64 result = budget.heapBudget[main_heap];
+    if (heap_size_limit != 0) {
+        result = (std::min)(result, heap_size_limit);
+    }
     for (const size_t heap : valid_heap_memory) {
-        result += budget.heapBudget[heap];
+        if (heap != main_heap) {
+            const VmaStatistics& statistics = heap_budgets[heap].statistics;
+            const u64 unused = statistics.blockBytes - statistics.allocationBytes;
+            result += budget.heapUsage[heap] - (std::min)(budget.heapUsage[heap], unused);
+        }
     }
     return result;
 }
@@ -1652,6 +1692,15 @@ void Device::CollectPhysicalMemoryInfo() {
     device_access_memory = 0;
     u64 device_initial_usage = 0;
     u64 local_memory = 0;
+    // EDEN_NX2_VRAM_LIMIT_MIB=<n>: treat every device-local heap as n MiB (small card tests).
+    if (const char* value = std::getenv("EDEN_NX2_VRAM_LIMIT_MIB")) {
+        heap_size_limit = std::strtoull(value, nullptr, 10) << 20;
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_VRAM_LIMIT_MIB: device-local heaps limited to {} MiB",
+                 heap_size_limit >> 20);
+    }
+    const auto limit = [this](u64 size) {
+        return heap_size_limit != 0 ? (std::min)(size, heap_size_limit) : size;
+    };
     for (size_t element = 0; element < num_properties; ++element) {
         const bool is_heap_local =
             (mem_properties.memoryHeaps[element].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
@@ -1659,15 +1708,22 @@ void Device::CollectPhysicalMemoryInfo() {
             continue;
         }
         valid_heap_memory.push_back(element);
+        const VkMemoryHeap& main = mem_properties.memoryHeaps[main_heap];
+        u64 heap_size = mem_properties.memoryHeaps[element].size;
         if (is_heap_local) {
-            local_memory += mem_properties.memoryHeaps[element].size;
+            if ((main.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0 || heap_size > main.size) {
+                main_heap = element;
+            }
+            heap_size = limit(heap_size);
+            local_memory += heap_size;
         }
         if (extensions.memory_budget) {
             device_initial_usage += budget.heapUsage[element];
-            device_access_memory += budget.heapBudget[element];
+            device_access_memory += is_heap_local ? limit(budget.heapBudget[element])
+                                                  : budget.heapBudget[element];
             continue;
         }
-        device_access_memory += mem_properties.memoryHeaps[element].size;
+        device_access_memory += heap_size;
     }
     if (is_integrated) {
         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
