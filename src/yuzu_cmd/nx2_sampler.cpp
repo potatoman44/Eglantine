@@ -163,7 +163,14 @@ struct Symbolizer {
             return;
         }
         set_options(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-        if (!initialize(GetCurrentProcess(), nullptr, TRUE)) {
+        // Search next to the executable: the PDBs ship beside it, and the working directory is
+        // wherever the user started it from.
+        char exe[MAX_PATH]{};
+        GetModuleFileNameA(nullptr, exe, sizeof(exe));
+        std::string search{exe};
+        search.erase(search.find_last_of('\\') == std::string::npos ? 0
+                                                                     : search.find_last_of('\\'));
+        if (!initialize(GetCurrentProcess(), search.empty() ? nullptr : search.c_str(), TRUE)) {
             from_address = nullptr;
         }
     }
@@ -191,7 +198,11 @@ struct Symbolizer {
             char path[MAX_PATH] = "?";
             GetModuleFileNameA(module, path, sizeof(path));
             const char* base = std::strrchr(path, '\\');
-            it->second = std::string{base != nullptr ? base + 1 : path} + "!?";
+            char offset[32];
+            std::snprintf(offset, sizeof(offset), "+0x%llx",
+                          static_cast<unsigned long long>(address -
+                                                          reinterpret_cast<DWORD64>(module)));
+            it->second = std::string{base != nullptr ? base + 1 : path} + offset;
         } else {
             it->second = "(jit)";
         }
@@ -204,7 +215,8 @@ struct Symbolizer {
 
 void Report(const std::vector<Target>& targets, const std::vector<Sample>& samples,
             const char* path) {
-    Symbolizer symbolizer;
+    // SymInitialize can only run once per process, and several rounds report.
+    static Symbolizer symbolizer;
     std::FILE* const file = std::fopen(path, "w");
     if (file == nullptr) {
         return;
